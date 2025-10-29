@@ -7,7 +7,7 @@ A modern React-based audition platform for talent vetting with audio recording, 
 ```bash
 # Install dependencies
 npm install
-
+node server.js
 # Start development server
 npm run dev
 

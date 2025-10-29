@@ -86,6 +86,18 @@ app.post('/api/submit-audition', upload.array('audio_files'), (req, res) => {
   });
 });
 
+// --- Endpoint 3: Serve uploaded audio files ---
+app.get('/uploads/:filename', (req, res) => {
+  const filePath = path.join(uploadDir, req.params.filename);
+
+  // Check if file exists
+  if (fs.existsSync(filePath)) {
+    res.sendFile(filePath);
+  } else {
+    res.status(404).json({ success: false, message: "File not found." });
+  }
+});
+
 // Start server
 const PORT = 4000;
 app.listen(PORT, () => {
