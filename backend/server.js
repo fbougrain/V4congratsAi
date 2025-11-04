@@ -237,38 +237,36 @@ app.get('/api/opportunities', async (req, res) => {
 // ------------------ Submit Answer Endpoint ------------------
 
 // Initialize Gemini
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// Initialize Gemini at the top of your file (after other initializations)
-let geminiModel = null;
-if (process.env.GEMINI_API_KEY) {
-  try {
-    const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    geminiModel = genai.getGenerativeModel({ model: 'gemini-1.5-flash' });
-    console.log('✅ Gemini AI initialized for transcription');
-  } catch (error) {
-    console.warn('⚠️  Failed to initialize Gemini:', error.message);
-  }
+// Initialize Supabase
+
+// ---------------- Claude Initialization ----------------
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+// make sure node-fetch is installed if using ES modules
+
+let googleApiKey = process.env.GOOGLE_API_KEY || 'AIzaSyBz2ySIZlr5zwnND2ytAxqT9IjLl70UOfo';
+if (googleApiKey) {
+  console.log("✅ Google Speech-to-Text API initialized for transcription");
 } else {
-  console.warn('⚠️  GEMINI_API_KEY not found in .env');
+  console.warn("⚠️ GOOGLE_API_KEY not found in .env");
 }
 
-// In your submit-answer endpoint:
-app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req, res) => {
+// ---------------- Submit Answer Endpoint ----------------
+app.post("/api/audition/submit-answer", upload.single("audio_file"), async (req, res) => {
   try {
     const { opportunityId, userId, questionId, questionText } = req.body;
 
     if (!opportunityId || !userId || !questionId || !questionText) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields'
+        message: "Missing required fields",
       });
     }
 
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        message: 'No audio file provided'
+        message: "No audio file provided",
       });
     }
 
@@ -276,58 +274,110 @@ app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req,
     const timestamp = Date.now();
     const filePath = `answers/${userId}/${opportunityId}/${questionId}_${timestamp}.mp3`;
 
-    // Upload audio to Supabase
+    // Upload to Supabase
     const { error: uploadError } = await supabase.storage
-      .from('audition-recordings')
+      .from("audition-recordings")
       .upload(filePath, file.buffer, {
         contentType: file.mimetype,
-        upsert: true
+        upsert: true,
       });
 
     if (uploadError) throw new Error(`Failed to upload audio: ${uploadError.message}`);
 
-    const { data: { publicUrl } } = supabase.storage
-      .from('audition-recordings')
-      .getPublicUrl(filePath);
+    const {
+      data: { publicUrl },
+    } = supabase.storage.from("audition-recordings").getPublicUrl(filePath);
 
-    // ------------------ Transcription with Gemini ------------------
-    let transcript = '';
-    
-    if (geminiModel) {
-      console.log('🎤 Transcribing audio with Gemini...');
-      
+    // ---------------- Transcription with Google Speech-to-Text ----------------
+    let transcript = "";
+
+    if (googleApiKey) {
+      console.log("🎤 Transcribing audio with Google Speech-to-Text...");
+      console.log("📊 Audio file details:", {
+        mimetype: file.mimetype,
+        size: file.size,
+        originalname: file.originalname,
+      });
+
       try {
-        // Convert buffer to base64
-        const audioBase64 = file.buffer.toString('base64');
+        // Validate file size (Google has 10MB limit for inline audio)
+        if (file.size > 10 * 1024 * 1024) {
+          throw new Error("Audio file exceeds 10MB limit for inline recognition");
+        }
+
+        const audioBase64 = file.buffer.toString("base64");
+
+        // Determine encoding based on mimetype
+        let encoding = "MP3";
+        let sampleRateHertz = 48000; // Default for most recordings
         
-        // Prepare the request with audio and prompt
-        const result = await geminiModel.generateContent([
+        if (file.mimetype.includes("webm")) {
+          encoding = "WEBM_OPUS";
+          sampleRateHertz = 48000;
+        } else if (file.mimetype.includes("wav")) {
+          encoding = "LINEAR16";
+          sampleRateHertz = 44100;
+        } else if (file.mimetype.includes("ogg")) {
+          encoding = "OGG_OPUS";
+          sampleRateHertz = 48000;
+        } else if (file.mimetype.includes("mp3") || file.mimetype.includes("mpeg")) {
+          encoding = "MP3";
+          sampleRateHertz = 48000;
+        }
+
+        console.log(`🔧 Using encoding: ${encoding}, sample rate: ${sampleRateHertz}`);
+
+        const response = await fetch(
+          `https://speech.googleapis.com/v1/speech:recognize?key=${googleApiKey}`,
           {
-            inlineData: {
-              data: audioBase64,
-              mimeType: file.mimetype // 'audio/mpeg' for MP3
-            }
-          },
-          "Please transcribe this audio recording word for word. Only provide the transcription, no additional commentary."
-        ]);
-        
-        const response = await result.response;
-        transcript = response.text() || '[No speech detected]';
-        
-        console.log(`✅ Transcription complete: "${transcript.substring(0, 100)}..."`);
-        
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              config: {
+                encoding: encoding,
+                sampleRateHertz: sampleRateHertz,
+                audioChannelCount: 1, // Mono audio
+                languageCode: "en-US",
+                enableAutomaticPunctuation: true,
+                model: "default",
+                useEnhanced: true, // Better quality if available
+              },
+              audio: { content: audioBase64 },
+            }),
+          }
+        );
+
+        const data = await response.json();
+
+        // Log the full response for debugging
+        console.log("📝 Google API response:", JSON.stringify(data, null, 2));
+
+        if (data.error) {
+          console.error("❌ Google API error:", data.error);
+          throw new Error(data.error.message);
+        }
+
+        if (!data.results || data.results.length === 0) {
+          transcript = "[No speech detected in audio]";
+          console.warn("⚠️ No speech detected - check audio quality or sample rate");
+        } else {
+          transcript = data.results
+            .map((r) => r.alternatives[0].transcript)
+            .join(" ");
+          console.log(`✅ Transcription complete: "${transcript}"`);
+        }
       } catch (transcriptionError) {
-        console.error('⚠️  Transcription failed:', transcriptionError);
+        console.error("⚠️ Transcription failed:", transcriptionError);
         transcript = `[Transcription failed: ${transcriptionError.message}]`;
       }
     } else {
-      console.log('⏭️  Skipping transcription (Gemini not configured)');
-      transcript = '[Transcription disabled - Gemini API key not configured]';
+      console.log("⏭️ Skipping transcription (Google API key not configured)");
+      transcript = "[Transcription disabled - Google API key not configured]";
     }
 
-    // Save to DB
+    // ---------------- Save to Supabase DB ----------------
     const { data: answerData, error: dbError } = await supabase
-      .from('audition_answers')
+      .from("audition_answers")
       .insert({
         user_id: userId,
         opportunity_id: opportunityId,
@@ -336,7 +386,7 @@ app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req,
         audio_url: publicUrl,
         audio_path: filePath,
         transcript: transcript,
-        submitted_at: new Date().toISOString()
+        submitted_at: new Date().toISOString(),
       })
       .select();
 
@@ -344,20 +394,144 @@ app.post('/api/audition/submit-answer', upload.single('audio_file'), async (req,
 
     res.status(200).json({
       success: true,
-      message: 'Answer submitted successfully',
+      message: "Answer submitted successfully",
       data: {
         answerId: answerData[0].id,
         audioUrl: publicUrl,
         transcript,
-        questionId
-      }
+        questionId,
+      },
     });
-
   } catch (error) {
-    console.error('❌ Error in submit-answer:', error);
+    console.error("❌ Error in submit-answer:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 });
+// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+//  // make sure node-fetch is installed if using ES modules
+
+// let googleApiKey = process.env.GOOGLE_API_KEY || 'AIzaSyBz2ySIZlr5zwnND2ytAxqT9IjLl70UOfo';
+// if (googleApiKey) {
+//   console.log("✅ Google Speech-to-Text API initialized for transcription");
+// } else {
+//   console.warn("⚠️ GOOGLE_API_KEY not found in .env");
+// }
+
+// // ---------------- Submit Answer Endpoint ----------------
+// app.post("/api/audition/submit-answer", upload.single("audio_file"), async (req, res) => {
+//   try {
+//     const { opportunityId, userId, questionId, questionText } = req.body;
+
+//     if (!opportunityId || !userId || !questionId || !questionText) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Missing required fields",
+//       });
+//     }
+
+//     if (!req.file) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "No audio file provided",
+//       });
+//     }
+
+//     const file = req.file;
+//     const timestamp = Date.now();
+//     const filePath = `answers/${userId}/${opportunityId}/${questionId}_${timestamp}.mp3`;
+
+//     // Upload to Supabase
+//     const { error: uploadError } = await supabase.storage
+//       .from("audition-recordings")
+//       .upload(filePath, file.buffer, {
+//         contentType: file.mimetype,
+//         upsert: true,
+//       });
+
+//     if (uploadError) throw new Error(`Failed to upload audio: ${uploadError.message}`);
+
+//     const {
+//       data: { publicUrl },
+//     } = supabase.storage.from("audition-recordings").getPublicUrl(filePath);
+
+//     // ---------------- Transcription with Google Speech-to-Text ----------------
+//     let transcript = "";
+
+//     if (googleApiKey) {
+//       console.log("🎤 Transcribing audio with Google Speech-to-Text...");
+
+//       try {
+//         const audioBase64 = file.buffer.toString("base64");
+
+//         const response = await fetch(
+//           `https://speech.googleapis.com/v1/speech:recognize?key=${googleApiKey}`,
+//           {
+//             method: "POST",
+//             headers: { "Content-Type": "application/json" },
+//             body: JSON.stringify({
+//               config: {
+//                 encoding: "MP3",
+//                 languageCode: "en-US",
+//                 enableAutomaticPunctuation: true,
+//               },
+//               audio: { content: audioBase64 },
+//             }),
+//           }
+//         );
+
+//         const data = await response.json();
+
+//         if (data.error) {
+//           throw new Error(data.error.message);
+//         }
+
+//         transcript =
+//           data.results?.map((r) => r.alternatives[0].transcript).join(" ") ||
+//           "[No speech detected]";
+//         console.log(`✅ Transcription complete: "${transcript.substring(0, 100)}..."`);
+//       } catch (transcriptionError) {
+//         console.error("⚠️ Transcription failed:", transcriptionError);
+//         transcript = `[Transcription failed: ${transcriptionError.message}]`;
+//       }
+//     } else {
+//       console.log("⏭️ Skipping transcription (Google API key not configured)");
+//       transcript = "[Transcription disabled - Google API key not configured]";
+//     }
+
+//     // ---------------- Save to Supabase DB ----------------
+//     const { data: answerData, error: dbError } = await supabase
+//       .from("audition_answers")
+//       .insert({
+//         user_id: userId,
+//         opportunity_id: opportunityId,
+//         question_id: questionId,
+//         question_text: questionText,
+//         audio_url: publicUrl,
+//         audio_path: filePath,
+//         transcript: transcript,
+//         submitted_at: new Date().toISOString(),
+//       })
+//       .select();
+
+//     if (dbError) throw new Error(`Failed to save answer: ${dbError.message}`);
+
+//     res.status(200).json({
+//       success: true,
+//       message: "Answer submitted successfully",
+//       data: {
+//         answerId: answerData[0].id,
+//         audioUrl: publicUrl,
+//         transcript,
+//         questionId,
+//       },
+//     });
+//   } catch (error) {
+//     console.error("❌ Error in submit-answer:", error);
+//     res.status(500).json({ success: false, message: error.message });
+//   }
+// });
+
+
 // ✅ Server start
 // const PORT = process.env.PORT || 4000;
 // app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
